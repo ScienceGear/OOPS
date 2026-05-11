@@ -1,0 +1,4 @@
+=== Parking Summary ===
+Total Vehicles Ever Parked : 1
+Total Tax Collected        : Rs. 6.00
+Grand Total Revenue        : Rs. 0.00
