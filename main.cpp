@@ -6,6 +6,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
+#include <vector>
+#include <windowsx.h>
 using namespace std;
 
 
@@ -182,6 +184,14 @@ double ParkingStats::totalTax    = 0.0;
 class ParkingSystem;
 void printReceipt(Vehicle* v, double fee, double tax);
 
+struct SlotSnapshot {
+    int slot;
+    string number;
+    string type;
+    int hours;
+    bool vip;
+};
+
 string buildVehicleRow(Vehicle* v) {
     ostringstream out;
     out << left
@@ -254,6 +264,43 @@ public:
 
     ~ParkingSystem() {
         for (int i = 0; i < count; i++) delete slots[i];
+    }
+
+    vector<SlotSnapshot> getSlotSnapshots() {
+        vector<SlotSnapshot> snapshot;
+        snapshot.reserve(count);
+        for (int i = 0; i < count; i++) {
+            snapshot.push_back({
+                slots[i]->getSlot(),
+                slots[i]->getNumber(),
+                slots[i]->getType(),
+                slots[i]->getHours(),
+                slots[i]->isVIP()
+            });
+        }
+        return snapshot;
+    }
+
+    string slotDetailText(int slotNumber) {
+        if (slotNumber < 1 || slotNumber > 100)
+            throw invalid_argument("Slot must be between 1 and 100.");
+
+        int idx = findBySlot(slotNumber);
+        ostringstream out;
+        out << "Slot " << slotNumber << "\n";
+        if (idx == -1) {
+            out << "Status: Empty\n";
+            return out.str();
+        }
+
+        Vehicle* vehicle = slots[idx];
+        out << "Status: Occupied\n";
+        out << "Number : " << vehicle->getNumber() << "\n";
+        out << "Type   : " << vehicle->getType() << "\n";
+        out << "Hours  : " << vehicle->getHours() << "\n";
+        out << "VIP    : " << (vehicle->isVIP() ? "Yes" : "No") << "\n";
+        out << "Fee    : Rs. " << fixed << setprecision(2) << vehicle->calculateFee() << "\n";
+        return out.str();
     }
 
     string parkVehicleDirect(const string& num, int type, int hours, bool vip) {
@@ -463,6 +510,7 @@ void printReceipt(Vehicle* v, double fee, double tax) {
 struct GuiState {
     HWND hwnd = nullptr;
     HWND output = nullptr;
+    HWND slotMap = nullptr;
     HWND passEdit = nullptr;
     HWND unlockButton = nullptr;
     HWND numberEdit = nullptr;
@@ -481,10 +529,12 @@ struct GuiState {
     HWND exitButton = nullptr;
     HWND banner = nullptr;
     HWND subtitle = nullptr;
+    HWND mapHint = nullptr;
     HFONT titleFont = nullptr;
     HFONT uiFont = nullptr;
     HFONT monoFont = nullptr;
     HBRUSH background = nullptr;
+    int selectedSlot = -1;
     bool unlocked = false;
 };
 
@@ -505,7 +555,9 @@ enum ControlId {
     ID_CLEAR_BUTTON,
     ID_SAVE_BUTTON,
     ID_EXIT_BUTTON,
-    ID_OUTPUT
+    ID_OUTPUT,
+    ID_SLOTMAP,
+    ID_MAP_HINT
 };
 
 GuiState gGui;
@@ -548,6 +600,10 @@ void setOutputText(const string& text) {
     if (gGui.output) SendMessageA(gGui.output, EM_LINESCROLL, 0, 1000);
 }
 
+void refreshSlotMap() {
+    if (gGui.slotMap) InvalidateRect(gGui.slotMap, nullptr, TRUE);
+}
+
 void appendOutput(const string& text) {
     if (!gLog.empty() && gLog.back() != '\n') gLog += "\r\n";
     gLog += text;
@@ -565,6 +621,157 @@ void setMainControlsEnabled(bool enabled) {
         gGui.displayButton, gGui.summaryButton, gGui.clearButton, gGui.saveButton
     };
     for (HWND control : controls) if (control) EnableWindow(control, enabled);
+}
+
+COLORREF colorForType(const string& type, bool vip) {
+    if (type == "Car") return vip ? RGB(37, 99, 235) : RGB(59, 130, 246);
+    if (type == "Bike") return vip ? RGB(22, 163, 74) : RGB(34, 197, 94);
+    if (type == "Truck") return vip ? RGB(234, 88, 12) : RGB(249, 115, 22);
+    return RGB(203, 213, 225);
+}
+
+void drawLegend(HDC hdc, int x, int y) {
+    struct LegendItem { const char* label; COLORREF color; };
+    LegendItem items[] = {
+        {"Car", RGB(59, 130, 246)},
+        {"Bike", RGB(34, 197, 94)},
+        {"Truck", RGB(249, 115, 22)},
+        {"Empty", RGB(203, 213, 225)}
+    };
+
+    int offsetX = x;
+    for (const auto& item : items) {
+        RECT swatch = {offsetX, y, offsetX + 14, y + 14};
+        HBRUSH brush = CreateSolidBrush(item.color);
+        FillRect(hdc, &swatch, brush);
+        DeleteObject(brush);
+        FrameRect(hdc, &swatch, reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        TextOutA(hdc, offsetX + 20, y - 1, item.label, lstrlenA(item.label));
+        offsetX += 92;
+    }
+}
+
+int slotAtPoint(HWND hwnd, int x, int y) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int padding = 16;
+    const int gridTop = 76;
+    const int cols = 10;
+    const int rows = 10;
+    const int gap = 6;
+    int gridWidth = rc.right - padding * 2;
+    int gridHeight = rc.bottom - gridTop - padding;
+    int cellW = (gridWidth - gap * (cols - 1)) / cols;
+    int cellH = (gridHeight - gap * (rows - 1)) / rows;
+    int cell = min(cellW, cellH);
+    if (cell < 20) cell = 20;
+
+    x -= padding;
+    y -= gridTop;
+    if (x < 0 || y < 0) return -1;
+
+    int col = x / (cell + gap);
+    int row = y / (cell + gap);
+    if (col < 0 || col >= cols || row < 0 || row >= rows) return -1;
+
+    int localX = x % (cell + gap);
+    int localY = y % (cell + gap);
+    if (localX >= cell || localY >= cell) return -1;
+
+    return row * cols + col + 1;
+}
+
+void drawSlotMap(HDC hdc, HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    HBRUSH background = CreateSolidBrush(RGB(248, 250, 252));
+    FillRect(hdc, &rc, background);
+    DeleteObject(background);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(15, 23, 42));
+
+    const int padding = 16;
+    const int titleY = 12;
+    const int legendY = 40;
+    const int gridTop = 76;
+    const int cols = 10;
+    const int rows = 10;
+    const int gap = 6;
+
+    TextOutA(hdc, padding, titleY, "Live Slot Map", 13);
+    TextOutA(hdc, padding, 24, "Click any slot to inspect it", 28);
+    drawLegend(hdc, padding, legendY);
+
+    auto snapshots = gParking.getSlotSnapshots();
+    int gridWidth = rc.right - padding * 2;
+    int gridHeight = rc.bottom - gridTop - padding;
+    int cellW = (gridWidth - gap * (cols - 1)) / cols;
+    int cellH = (gridHeight - gap * (rows - 1)) / rows;
+    int cell = min(cellW, cellH);
+    if (cell < 20) cell = 20;
+
+    for (int slot = 1; slot <= 100; slot++) {
+        int idx = slot - 1;
+        int row = idx / cols;
+        int col = idx % cols;
+        int left = padding + col * (cell + gap);
+        int top = gridTop + row * (cell + gap);
+        RECT tile = {left, top, left + cell, top + cell};
+
+        const SlotSnapshot* snapshot = nullptr;
+        for (const auto& item : snapshots) {
+            if (item.slot == slot) {
+                snapshot = &item;
+                break;
+            }
+        }
+
+        COLORREF fill = snapshot ? colorForType(snapshot->type, snapshot->vip) : RGB(229, 231, 235);
+        HBRUSH brush = CreateSolidBrush(fill);
+        FillRect(hdc, &tile, brush);
+        DeleteObject(brush);
+
+        bool selected = gGui.selectedSlot == slot;
+        HPEN border = CreatePen(PS_SOLID, selected ? 3 : 1, selected ? RGB(15, 23, 42) : RGB(100, 116, 139));
+        HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
+        HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+        Rectangle(hdc, tile.left, tile.top, tile.right, tile.bottom);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(border);
+
+        string label = to_string(slot);
+        SetTextColor(hdc, snapshot ? RGB(255, 255, 255) : RGB(71, 85, 105));
+        SetTextAlign(hdc, TA_CENTER | TA_TOP);
+        TextOutA(hdc, left + cell / 2, top + 4, label.c_str(), static_cast<int>(label.size()));
+
+        if (snapshot) {
+            string typeMark = snapshot->type.substr(0, 1);
+            SetTextAlign(hdc, TA_CENTER | TA_BASELINE);
+            TextOutA(hdc, left + cell / 2, top + cell / 2 + 8, typeMark.c_str(), static_cast<int>(typeMark.size()));
+        }
+    }
+
+    SetTextAlign(hdc, TA_LEFT | TA_TOP);
+}
+
+LRESULT CALLBACK SlotMapProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        drawSlotMap(hdc, hwnd);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int slot = slotAtPoint(hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        if (slot != -1) SendMessageA(GetParent(hwnd), WM_APP + 1, static_cast<WPARAM>(slot), 0);
+        return 0;
+    }
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
 void applyFonts(HWND hwnd) {
@@ -633,19 +840,24 @@ void createGuiControls(HWND hwnd) {
     gGui.exitButton = CreateWindowA("BUTTON", "Exit", WS_CHILD | WS_VISIBLE,
         134, 562, 100, 32, hwnd, reinterpret_cast<HMENU>(ID_EXIT_BUTTON), nullptr, nullptr);
 
+    gGui.slotMap = CreateWindowExA(WS_EX_CLIENTEDGE, "ParkingSlotMap", "", WS_CHILD | WS_VISIBLE,
+        468, 82, 480, 258, hwnd, reinterpret_cast<HMENU>(ID_SLOTMAP), nullptr, nullptr);
+    gGui.mapHint = CreateWindowA("STATIC", "Pick a slot on the board to inspect it, then use the action panel below.", WS_CHILD | WS_VISIBLE,
+        468, 342, 480, 20, hwnd, reinterpret_cast<HMENU>(ID_MAP_HINT), nullptr, nullptr);
     gGui.output = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-        468, 82, 480, 512, hwnd, reinterpret_cast<HMENU>(ID_OUTPUT), nullptr, nullptr);
+        468, 366, 480, 228, hwnd, reinterpret_cast<HMENU>(ID_OUTPUT), nullptr, nullptr);
 
     HWND allControls[] = {
         gGui.banner, gGui.subtitle, gGui.passEdit, gGui.unlockButton,
         gGui.numberEdit, gGui.typeCombo, gGui.hoursEdit, gGui.vipCheck, gGui.parkButton,
         gGui.removeEdit, gGui.removeButton, gGui.slotEdit, gGui.searchButton,
         gGui.displayButton, gGui.summaryButton, gGui.clearButton, gGui.saveButton,
-        gGui.exitButton, gGui.output
+        gGui.exitButton, gGui.slotMap, gGui.mapHint, gGui.output
     };
     for (HWND control : allControls) applyFonts(control);
 
     SendMessageA(gGui.banner, WM_SETFONT, reinterpret_cast<WPARAM>(gGui.titleFont), TRUE);
+    SendMessageA(gGui.slotMap, WM_SETFONT, reinterpret_cast<WPARAM>(gGui.monoFont), TRUE);
     SendMessageA(gGui.output, WM_SETFONT, reinterpret_cast<WPARAM>(gGui.monoFont), TRUE);
     setMainControlsEnabled(false);
 }
@@ -659,6 +871,18 @@ void initializeGuiTheme(HWND hwnd) {
     gGui.monoFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
 
+    static bool mapRegistered = false;
+    if (!mapRegistered) {
+        WNDCLASSA mapClass = {};
+        mapClass.lpfnWndProc = SlotMapProc;
+        mapClass.hInstance = GetModuleHandleA(nullptr);
+        mapClass.lpszClassName = "ParkingSlotMap";
+        mapClass.hCursor = LoadCursor(nullptr, IDC_HAND);
+        mapClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassA(&mapClass);
+        mapRegistered = true;
+    }
+
     createGuiControls(hwnd);
 }
 
@@ -667,6 +891,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE:
         initializeGuiTheme(hwnd);
         gParking.loadFromFile();
+        gGui.selectedSlot = -1;
         setOutputText("Parking dashboard ready.\r\nEnter the admin password to unlock the controls.");
         break;
 
@@ -702,6 +927,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool vip = SendMessageA(gGui.vipCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 string result = gParking.parkVehicleDirect(getWindowTextString(gGui.numberEdit), typeIndex + 1, hours, vip);
                 appendOutput(result);
+                gGui.selectedSlot = -1;
+                refreshSlotMap();
                 SetWindowTextA(gGui.numberEdit, "");
                 SetWindowTextA(gGui.hoursEdit, "");
                 SendMessageA(gGui.vipCheck, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -710,17 +937,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 string num = getWindowTextString(gGui.removeEdit);
                 if (num.empty()) throw runtime_error("Enter a vehicle number to remove.");
                 appendOutput(gParking.removeVehicleDirect(num));
+                gGui.selectedSlot = -1;
+                refreshSlotMap();
                 SetWindowTextA(gGui.removeEdit, "");
             } else if (id == ID_SEARCH_BUTTON && code == BN_CLICKED) {
                 int slot = 0;
                 if (!parseIntText(gGui.slotEdit, 1, 100, slot)) throw runtime_error("Slot must be between 1 and 100.");
                 appendOutput(gParking.searchText(slot));
+                gGui.selectedSlot = slot;
+                refreshSlotMap();
             } else if (id == ID_DISPLAY_BUTTON && code == BN_CLICKED) {
                 appendOutput(gParking.displayAllText());
             } else if (id == ID_SUMMARY_BUTTON && code == BN_CLICKED) {
                 appendOutput(gParking.summaryText());
             } else if (id == ID_CLEAR_BUTTON && code == BN_CLICKED) {
                 gParking.clearAll();
+                gGui.selectedSlot = -1;
+                refreshSlotMap();
                 appendOutput("All parked vehicles cleared.");
             } else if (id == ID_SAVE_BUTTON && code == BN_CLICKED) {
                 gParking.saveToFile();
@@ -736,6 +969,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } catch (...) {
             appendOutput("Something went wrong.");
         }
+        break;
+    }
+
+    case WM_APP + 1: {
+        int slot = static_cast<int>(wParam);
+        gGui.selectedSlot = slot;
+        appendOutput(gParking.slotDetailText(slot));
+        refreshSlotMap();
+        SetWindowTextA(gGui.slotEdit, to_string(slot).c_str());
         break;
     }
 
